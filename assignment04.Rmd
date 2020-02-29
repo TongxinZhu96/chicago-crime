@@ -3,28 +3,145 @@ title: "assignment04.Rmd"
 author: "Tongxin Zhu"
 date: "2/27/2020"
 output: html_document
+
 ---
-
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+```{r set up}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(quiet = TRUE)
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+1. Data Loading & Cleaning
+```{r}
+library(readr)
+library(stringr)
+library(tidyverse)
+Crimes_reduced <- read_csv("data/Crimes-reduced.csv",
+                           col_types = cols(Latitude = col_character(), 
+                                            Longitude = col_character()))
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+View(Crimes_reduced)
 
-```{r cars}
-summary(cars)
+names(Crimes_reduced) <- str_replace_all(names(Crimes_reduced), c(" "="_"))
+names(Crimes_reduced) <- str_to_lower(names(Crimes_reduced))
+```
+I would expect the same error because x_coordinate, y_coordinate and location variables are regarded as logical variables by system default, which means they can only take the value of "True/False" but not numeric values. Therefore, when they showed numeric values, it appeared as errors.
+
+
+2. Filtering the data to homicides within ten years of today
+```{r}
+library(lubridate)
+crime_reduced <- Crimes_reduced %>% filter(longitude!="NA", latitude !="NA")
+
+homicides <- crime_reduced %>% filter(primary_type == "HOMICIDE")
+
+homicides$date = as.Date.character(homicides$date, format = c("%m/%d/%Y"))
+
+crimes_lim <- homicides %>%
+  filter(date >= "2010-02-25")
+
+table(year(crimes_lim$date))
+
+min(crimes_lim$date)
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
+3. Convert Lat/Lon to Points Geometry
+```{r}
+library(sf)
+crimes_lim <- st_as_sf(
+  crimes_lim,
+  coords = c("longitude", "latitude"),
+  crs = 4326)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+glimpse(crimes_lim)
+
+class(crimes_lim)
+
+ggplot(crimes_lim)+
+  geom_sf(aes(color=arrest), alpha=0.2)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+4. Load Census Tracts, Perform a Spatial Join, and Create Choropleth
+```{r}
+library(sf)
+library(gridExtra)
+chicago_gdf <- st_read("data/Boundaries - Census Tracts - 2010/geo_export_256823b2-3748-42c1-a544-7329a725afb5.shp") %>%
+  select(geoid10, geometry)
+
+chicago_gdf <- st_set_crs(chicago_gdf, 4326)
+chicago_merged <- st_join(chicago_gdf, crimes_lim)
+
+chicago_merged_agg <-chicago_merged %>%
+  group_by(geoid10) %>%
+  summarise(arrest_tot=sum(arrest), count=length(arrest)) %>%
+  mutate(arrest_rate=arrest_tot/count)
+chicago_merged_agg <- na.omit(chicago_merged_agg)
+
+ggplot(chicago_merged_agg)+
+  geom_sf(aes(fill=count, alpha=arrest_rate, color=count))+
+  theme_void()
+```
+5. Using the Census API to retrieve household income, educational attainment,
+and poverty status for all of the Census tracts in Cook County, Illinois
+```{r api key}
+library(tidycensus)
+credential <- read_file("credentials.txt")
+census_api_key(credential, install = TRUE, overwrite = TRUE)
+```
+
+```{r retrieve census data with tidycensus}
+acs5 <- load_variables(2017, "acs5")
+
+cook13_17 <- get_acs(geography = "tract", 
+                     variables = c("B19001_001E", "B15003_001E", "B99172_001E"),
+                     state = "17", county = "031", year = 2017, output = "wide")
+```
+
+```{r Using URL to retrieve the same data}
+library(httr)
+library(jsonlite)
+credential <- read_file("credentials.txt")
+url <- "https://api.census.gov/data/2017/acs/acs5?get=NAME,B19001_001E,B15003_001E,B99172_001E&for=tract:*&in=state:17&in=county:031&key=90e7f8de0a44ee8d3576184aa7212a46334b848b"
+
+cook_json <- GET(url = url,
+                        user_agent("Georgetown Univ. Student Data Collector (tz163@georgetown.edu)"))
+
+http_status(cook_json)
+cook_json <- content(cook_json, as = "text")
+
+cook_matrix <- fromJSON(cook_json)
+cook_data <- as.tibble(cook_matrix[2:nrow(cook_matrix),],
+                       .name_repair = "minimal")
+names(cook_data) <- cook_matrix[1, ]
+
+check_tidy <- select(cook13_17, 3,5,7)
+check_url <- select(cook_data, 2:4)
+check_url$B19001_001E <- as.numeric(check_url$B19001_001E)
+check_url$B15003_001E <- as.numeric(check_url$B15003_001E)
+check_url$B99172_001E <- as.numeric(check_url$B99172_001E)
+all.equal(check_tidy, check_url)
+
+```
+
+
+6. Writing an R Function to Query the Census API and Create a Map
+```{r, results = "hide"}
+get_api <- function(cen_year=2017, cen_state="IL", cen_county="Cook", cen_inc="B19001_001E") {
+  
+censusapi <- get_acs(state = cen_state,
+                     county = cen_county,
+                     year = cen_year,
+                     variables = c(income = cen_inc),
+                     geography = "county", geometry = TRUE)
+  
+  map <- ggplot(censusapi)+
+  geom_sf()
+return(map)
+}
+
+get_api(2017, "17", "31", "B19001_001E")
+```
